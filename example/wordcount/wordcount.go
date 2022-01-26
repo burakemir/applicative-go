@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"strings"
 
-	ap "applicative-go/applicative"
+	ap "github.com/burakemir/applicative-go/applicative"
 )
 
 func main() {

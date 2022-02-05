@@ -25,6 +25,8 @@ import "fmt"
 type Node interface {
 	// Helpful debug string describing the pipeline.
 	Name() string
+	// Analyzes the pipeline, without running anything.
+	StaticAnalyze(Analyzer)
 }
 
 // PCol[T] plays a role similar to PCollection from Apache Beam SDK.
@@ -33,6 +35,8 @@ type Node interface {
 // The simplest way to run a pipeline is:
 // c.Exec(NewSink[T](func (elem T) { ...do something with elem... })
 type PCol[T any] interface {
+	Node
+
 	// Helpful debug string describing the pipeline.
 	Name() string
 	// Register with engine and executes computation.
@@ -47,6 +51,11 @@ type Engine[T any] interface {
 	emit(T)
 	// Invoked after the last call to emit(T).
 	done(Node)
+}
+
+type Analyzer interface {
+	// Invoked before the first call to emit(T).
+	Analyze(node Node, deps ...Node)
 }
 
 // Sink is the simplest implementation of engine, just a callback.
@@ -67,6 +76,7 @@ func (s Sink[T]) emit(t T) { s.fn(t) }
 func (s Sink[T]) done(c Node) {}
 
 // DebugSink is like Sink, but prints initialize and done calls.
+/*
 type DebugSink[T any] struct {
 	fn func(T)
 }
@@ -87,6 +97,7 @@ func (d DebugSink[T]) emit(t T) { d.fn(t) }
 func (d DebugSink[T]) done(node Node) {
 	fmt.Printf("done [%s]\n", node.Name())
 }
+*/
 
 // ConnectedEngine[S, T] takes an Engine[T] and adapts
 // it so it can act as an Engine[S]. It forwards initialize()
@@ -131,6 +142,10 @@ func (m Mapped[S, T]) Exec(engine Engine[T]) {
 	engine.done(m)
 }
 
+func (m Mapped[S, T]) StaticAnalyze(analyzer Analyzer) {
+	analyzer.Analyze(m, m.in)
+}
+
 // We choose a principled way to compose our deferred computations.
 // This is called fmap in Haskell.
 func Fmap[S, T any](fn func(S) T) func(PCol[S]) PCol[T] {
@@ -155,6 +170,10 @@ func (l Lifted[S, T]) Exec(engine Engine[T]) {
 	}, engine)
 	l.fncol.Exec(sink)
 	engine.done(l)
+}
+
+func (l Lifted[S, T]) StaticAnalyze(analyzer Analyzer) {
+	analyzer.Analyze(l, l.fncol, l.in)
 }
 
 // We are indeed dealing with applicative functors (strong monoidal
@@ -186,6 +205,10 @@ func (r ret[T]) Exec(engine Engine[T]) {
 	engine.done(r)
 }
 
+func (r ret[T]) StaticAnalyze(analyzer Analyzer) {
+	analyzer.Analyze(r)
+}
+
 // Ret turns a value of type T into a defered (immediate) computation.
 // In Haskell, this is called "pure".
 func Ret[T any](value T) PCol[T] {
@@ -210,6 +233,10 @@ func (p StringCol) Exec(engine Engine[string]) {
 	engine.done(p)
 }
 
+func (p StringCol) StaticAnalyze(analyzer Analyzer) {
+	analyzer.Analyze(p)
+}
+
 var _ PCol[string] = StringCol{}
 
 type flattened[T any] struct {
@@ -229,6 +256,10 @@ func (f flattened[T]) Exec(engine Engine[T]) {
 	}, engine)
 	f.pp.Exec(sink)
 	engine.done(f)
+}
+
+func (f flattened[T]) StaticAnalyze(analyzer Analyzer) {
+	analyzer.Analyze(f, f.pp)
 }
 
 // Flatten of PCol[PCol[T]] is left as exercise to the reader.
@@ -264,6 +295,10 @@ func (c counted[T]) Exec(engine Engine[Pair[T, int]]) {
 	engine.done(c)
 }
 
+func (c counted[T]) StaticAnalyze(analyzer Analyzer) {
+	analyzer.Analyze(c, c.p)
+}
+
 func Count[T comparable](p PCol[T]) PCol[Pair[T, int]] {
 	return counted[T]{p}
 }
@@ -286,6 +321,10 @@ func (f filtered[T]) Exec(engine Engine[T]) {
 	}, engine)
 	f.p.Exec(sink)
 	engine.done(f)
+}
+
+func (f filtered[T]) StaticAnalyze(analyzer Analyzer) {
+	analyzer.Analyze(f, f.p)
 }
 
 func Filter[T any](fn func(T) bool) func(PCol[T]) PCol[T] {

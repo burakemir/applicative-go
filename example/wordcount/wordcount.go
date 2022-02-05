@@ -86,9 +86,6 @@ func main() {
 			})
 		}})
 		h.Run()
-		for {
-			// loop
-		}
 	}
 
 }

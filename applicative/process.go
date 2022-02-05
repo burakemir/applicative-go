@@ -61,7 +61,9 @@ func (h *Hub) Run() {
 		reqProcess := req.Header.Get("process")
 		for _, p := range h.process {
 			if p.Name == reqProcess {
-				p.PipelineFn(RequestCol{req.ContentLength, req.Body}).Exec(p.SerializeFn(w))
+				task := p.PipelineFn(RequestCol{req.ContentLength, req.Body})
+				log.Printf("handling %s\n", task.Name())
+				task.Exec(p.SerializeFn(w))
 				break
 			}
 		}

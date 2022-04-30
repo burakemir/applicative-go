@@ -12,33 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package applicativepipeline is an exploration of go1.18beta1 generics
-// for constructing statically typed data processing pipelines.
+// Package applicative is primarily an exploration of golang generics
+// (parametric polymorphism) introduced in the Go 1.18 release.
 //
-// You need go1.18beta1, cf instructions at
-// https://go.dev/doc/tutorial/generics
-// Go 1.18 is expected to be released in February 2022.
-package applicativepipeline
+// An applicative functor is a mathematical concept and functional
+// programming pattern. In engineering, it often helps to have
+// formal, mathematical descriptions of problem domain. Making use
+// of these formalism to have an organized/structured approach is
+// very different from considering all programming as mathematics.
+//
+// We are interested here in the particular domain of stream processing,
+// or data processing pipelines. This domain is one born from practical
+// application and does not have "standard" formal descriptions.
+// The purpose of this library is not to capture applicative functors as
+// a programming abstraction, but rather to explore its usefulness
+// in structuring this problem domain.
+package applicative
 
 import "fmt"
 
-type Node interface {
+// StreamHandle is a Stream[A] where we don't care about its data type.
+type StreamHandle interface {
 	// Helpful debug string describing the pipeline.
 	Name() string
-	// Analyzes the pipeline, without running anything.
-	StaticAnalyze(Analyzer)
+
+	// Returns StreamHandles that are (upstream) dependencies.
+	Deps() []StreamHandle
 }
 
-// PCol[T] plays a role similar to PCollection from Apache Beam SDK.
-// It is a deferred computation that yields a bag (multiset) of T values.
+func StaticAnalyze[T any](StreamHandle StreamHandle, analyzer Analyzer[T]) T {
+	return analyzer(StreamHandle, StreamHandle.Deps()...)
+}
+
+type Analyzer[T any] func(StreamHandle StreamHandle, deps ...StreamHandle) T
+
+// Stream[T] is a deferred computation that yields a bag (multiset) of T values.
+// The type plays a role similar to Streamlection[T] from Apache Beam SDK.
 //
 // The simplest way to run a pipeline is:
 // c.Exec(NewSink[T](func (elem T) { ...do something with elem... })
-type PCol[T any] interface {
-	Node
+type Stream[T any] interface {
+	StreamHandle
 
-	// Helpful debug string describing the pipeline.
-	Name() string
 	// Register with engine and executes computation.
 	// Invokes callback in engine for every element.
 	Exec(Engine[T])
@@ -46,19 +61,14 @@ type PCol[T any] interface {
 
 type Engine[T any] interface {
 	// Invoked before the first call to emit(T).
-	initialize(node Node, deps ...Node)
+	initialize(StreamHandle StreamHandle)
 	// Callback invoked for every element of type T.
 	emit(T)
 	// Invoked after the last call to emit(T).
-	done(Node)
+	done(StreamHandle)
 }
 
-type Analyzer interface {
-	// Invoked before the first call to emit(T).
-	Analyze(node Node, deps ...Node)
-}
-
-// Sink is the simplest implementation of engine, just a callback.
+// Sink is the simplest implementation of engine, just a continuation (callback.)
 // This can be used for precomposition.
 type Sink[T any] struct {
 	fn func(T)
@@ -69,35 +79,33 @@ func NewSink[T any](fn func(T)) *Sink[T] {
 	return &Sink[T]{fn}
 }
 
-func (s Sink[T]) initialize(node Node, deps ...Node) {}
+func (s Sink[T]) initialize(StreamHandle StreamHandle) {}
 
 func (s Sink[T]) emit(t T) { s.fn(t) }
 
-func (s Sink[T]) done(c Node) {}
+func (s Sink[T]) done(c StreamHandle) {}
 
 // DebugSink is like Sink, but prints initialize and done calls.
-/*
 type DebugSink[T any] struct {
 	fn func(T)
 }
 
-func NewDebugSink[T any](fn func(T)) DebugSink[T] {
-	return DebugSink[T]{fn}
+func NewDebugSink[T any](fn func(T)) *DebugSink[T] {
+	return &DebugSink[T]{fn}
 }
 
-func (d DebugSink[T]) initialize(node Node, deps ...Node) {
-	fmt.Printf("initialize [%s]\n", node.Name())
-	for _, dep := range deps {
-		fmt.Printf("  dep: %s\n", dep.Name())
-	}
+func (d DebugSink[T]) initialize(StreamHandle StreamHandle) {
+	fmt.Printf("initialize [%s]\n", StreamHandle.Name())
+	//	for _, dep := range deps {
+	//		fmt.Printf("  dep: %s\n", dep.Name())
+	//	}
 }
 
 func (d DebugSink[T]) emit(t T) { d.fn(t) }
 
-func (d DebugSink[T]) done(node Node) {
-	fmt.Printf("done [%s]\n", node.Name())
+func (d DebugSink[T]) done(StreamHandle StreamHandle) {
+	fmt.Printf("done [%s]\n", StreamHandle.Name())
 }
-*/
 
 // ConnectedEngine[S, T] takes an Engine[T] and adapts
 // it so it can act as an Engine[S]. It forwards initialize()
@@ -112,15 +120,15 @@ func connect[S, T any](fn func(S), engine Engine[T]) ConnectedEngine[S, T] {
 	return ConnectedEngine[S, T]{fn, engine}
 }
 
-func (s ConnectedEngine[S, T]) initialize(c Node, deps ...Node) {
-	s.engine.initialize(c, deps...)
+func (s ConnectedEngine[S, T]) initialize(c StreamHandle) {
+	s.engine.initialize(c)
 }
 
 func (s ConnectedEngine[S, T]) emit(elem S) {
 	s.fn(elem)
 }
 
-func (s ConnectedEngine[S, T]) done(c Node) {
+func (s ConnectedEngine[S, T]) done(c StreamHandle) {
 	s.engine.done(c)
 }
 
@@ -128,7 +136,7 @@ type Mapped[S, T any] struct {
 	// Transformation to apply to each element.
 	fn func(S) T
 	// Input collection.
-	in PCol[S]
+	in Stream[S]
 }
 
 func (m Mapped[S, T]) Name() string {
@@ -136,27 +144,27 @@ func (m Mapped[S, T]) Name() string {
 }
 
 func (m Mapped[S, T]) Exec(engine Engine[T]) {
-	engine.initialize(m, m.in)
-	sink := connect[S, T](func(elem S) { engine.emit(m.fn(elem)) }, engine)
+	engine.initialize(m)
+	sink := connect(func(elem S) { engine.emit(m.fn(elem)) }, engine)
 	m.in.Exec(sink)
 	engine.done(m)
 }
 
-func (m Mapped[S, T]) StaticAnalyze(analyzer Analyzer) {
-	analyzer.Analyze(m, m.in)
+func (m Mapped[S, T]) Deps() []StreamHandle {
+	return []StreamHandle{m.in}
 }
 
 // We choose a principled way to compose our deferred computations.
 // This is called fmap in Haskell.
-func Fmap[S, T any](fn func(S) T) func(PCol[S]) PCol[T] {
-	return func(in PCol[S]) PCol[T] {
+func Fmap[S, T any](fn func(S) T) func(Stream[S]) Stream[T] {
+	return func(in Stream[S]) Stream[T] {
 		return Mapped[S, T]{fn, in}
 	}
 }
 
 type Lifted[S, T any] struct {
-	fncol PCol[func(S) T]
-	in    PCol[S]
+	fncol Stream[func(S) T]
+	in    Stream[S]
 }
 
 func (l Lifted[S, T]) Name() string {
@@ -164,16 +172,16 @@ func (l Lifted[S, T]) Name() string {
 }
 
 func (l Lifted[S, T]) Exec(engine Engine[T]) {
-	engine.initialize(l, l.fncol, l.in)
-	sink := connect[func(S) T, T](func(fn func(S) T) {
+	engine.initialize(l)
+	sink := connect(func(fn func(S) T) {
 		Mapped[S, T]{fn, l.in}.Exec(engine)
 	}, engine)
 	l.fncol.Exec(sink)
 	engine.done(l)
 }
 
-func (l Lifted[S, T]) StaticAnalyze(analyzer Analyzer) {
-	analyzer.Analyze(l, l.fncol, l.in)
+func (l Lifted[S, T]) Deps() []StreamHandle {
+	return []StreamHandle{l.fncol, l.in}
 }
 
 // We are indeed dealing with applicative functors (strong monoidal
@@ -181,14 +189,14 @@ func (l Lifted[S, T]) StaticAnalyze(analyzer Analyzer) {
 // In Haskell, this operator is called <*>.
 //
 // The name "lift" comes from the fact that lift(ret(fn)) will "lift" the
-// function fn : S -> T to operate on PCol[S] -> PCol[T].
+// function fn : S -> T to operate on Stream[S] -> Stream[T].
 //
 // The same "lifting" story could be told for Fmap, and indeed
 // each operations can be implemented in terms of the other.
 //
 // Note the similarity to axiom K from modal logic: ☐(S->T)->(☐S->☐T)
-func Lift[S, T any](fncol PCol[func(S) T]) func(PCol[S]) PCol[T] {
-	return func(in PCol[S]) PCol[T] { return Lifted[S, T]{fncol, in} }
+func Lift[S, T any](fncol Stream[func(S) T]) func(Stream[S]) Stream[T] {
+	return func(in Stream[S]) Stream[T] { return Lifted[S, T]{fncol, in} }
 }
 
 type ret[T any] struct {
@@ -205,13 +213,13 @@ func (r ret[T]) Exec(engine Engine[T]) {
 	engine.done(r)
 }
 
-func (r ret[T]) StaticAnalyze(analyzer Analyzer) {
-	analyzer.Analyze(r)
+func (r ret[T]) Deps() []StreamHandle {
+	return nil
 }
 
 // Ret turns a value of type T into a defered (immediate) computation.
 // In Haskell, this is called "pure".
-func Ret[T any](value T) PCol[T] {
+func Ret[T any](value T) Stream[T] {
 	return ret[T]{value}
 }
 
@@ -233,14 +241,14 @@ func (p StringCol) Exec(engine Engine[string]) {
 	engine.done(p)
 }
 
-func (p StringCol) StaticAnalyze(analyzer Analyzer) {
-	analyzer.Analyze(p)
+func (p StringCol) Deps() []StreamHandle {
+	return nil
 }
 
-var _ PCol[string] = StringCol{}
+var _ Stream[string] = StringCol{}
 
 type flattened[T any] struct {
-	pp PCol[[]T]
+	pp Stream[[]T]
 }
 
 func (f flattened[T]) Name() string {
@@ -248,8 +256,8 @@ func (f flattened[T]) Name() string {
 }
 
 func (f flattened[T]) Exec(engine Engine[T]) {
-	engine.initialize(f, f.pp)
-	sink := connect[[]T, T](func(ts []T) {
+	engine.initialize(f)
+	sink := connect(func(ts []T) {
 		for _, t := range ts {
 			engine.emit(t)
 		}
@@ -258,12 +266,12 @@ func (f flattened[T]) Exec(engine Engine[T]) {
 	engine.done(f)
 }
 
-func (f flattened[T]) StaticAnalyze(analyzer Analyzer) {
-	analyzer.Analyze(f, f.pp)
+func (f flattened[T]) Deps() []StreamHandle {
+	return []StreamHandle{f.pp}
 }
 
-// Flatten of PCol[PCol[T]] is left as exercise to the reader.
-func Flatten[T any](pp PCol[[]T]) PCol[T] {
+// Flatten of Stream[Stream[T]] is left as exercise to the reader.
+func Flatten[T any](pp Stream[[]T]) Stream[T] {
 	return flattened[T]{pp}
 }
 
@@ -273,7 +281,7 @@ type Pair[X, Y any] struct {
 }
 
 type counted[T comparable] struct {
-	p PCol[T]
+	p Stream[T]
 }
 
 func (c counted[T]) Name() string {
@@ -281,9 +289,9 @@ func (c counted[T]) Name() string {
 }
 
 func (c counted[T]) Exec(engine Engine[Pair[T, int]]) {
-	engine.initialize(c, c.p)
+	engine.initialize(c)
 	counts := make(map[T]int)
-	counter := connect[T, Pair[T, int]](func(t T) {
+	counter := connect(func(t T) {
 		count := counts[t]
 		count += 1
 		counts[t] = count
@@ -295,16 +303,16 @@ func (c counted[T]) Exec(engine Engine[Pair[T, int]]) {
 	engine.done(c)
 }
 
-func (c counted[T]) StaticAnalyze(analyzer Analyzer) {
-	analyzer.Analyze(c, c.p)
+func (c counted[T]) Deps() []StreamHandle {
+	return []StreamHandle{c.p}
 }
 
-func Count[T comparable](p PCol[T]) PCol[Pair[T, int]] {
+func Count[T comparable](p Stream[T]) Stream[Pair[T, int]] {
 	return counted[T]{p}
 }
 
 type filtered[T any] struct {
-	p  PCol[T]
+	p  Stream[T]
 	fn func(T) bool
 }
 
@@ -313,8 +321,8 @@ func (f filtered[T]) Name() string {
 }
 
 func (f filtered[T]) Exec(engine Engine[T]) {
-	engine.initialize(f, f.p)
-	sink := connect[T, T](func(t T) {
+	engine.initialize(f)
+	sink := connect(func(t T) {
 		if f.fn(t) {
 			engine.emit(t)
 		}
@@ -323,10 +331,10 @@ func (f filtered[T]) Exec(engine Engine[T]) {
 	engine.done(f)
 }
 
-func (f filtered[T]) StaticAnalyze(analyzer Analyzer) {
-	analyzer.Analyze(f, f.p)
+func (f filtered[T]) Deps() []StreamHandle {
+	return []StreamHandle{f.p}
 }
 
-func Filter[T any](fn func(T) bool) func(PCol[T]) PCol[T] {
-	return func(p PCol[T]) PCol[T] { return filtered[T]{p, fn} }
+func Filter[T any](fn func(T) bool) func(Stream[T]) Stream[T] {
+	return func(p Stream[T]) Stream[T] { return filtered[T]{p, fn} }
 }

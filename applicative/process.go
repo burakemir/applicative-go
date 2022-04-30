@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-package applicativepipeline
+package applicative
 
 import (
 	"bufio"
@@ -25,8 +25,8 @@ import (
 // on a single machine.
 type Process struct {
 	Name        string
-	PipelineFn  func(PCol[string]) PCol[string]
-	SerializeFn func(io.Writer) Sink[string]
+	PipelineFn  func(Stream[string]) Stream[string]
+	SerializeFn func(io.Writer) func(string)
 }
 
 type Hub struct {
@@ -63,11 +63,11 @@ func (r RequestCol) Exec(engine Engine[string]) {
 	engine.done(r)
 }
 
-func (r RequestCol) StaticAnalyze(analyzer Analyzer) {
-	analyzer.Analyze(r)
+func (r RequestCol) Deps() []StreamHandle {
+	return nil
 }
 
-var _ PCol[string] = StringCol{}
+var _ Stream[string] = StringCol{}
 
 func (h *Hub) Run() {
 	dispatch := func(w http.ResponseWriter, req *http.Request) {
@@ -76,7 +76,7 @@ func (h *Hub) Run() {
 			if p.Name == reqProcess {
 				task := p.PipelineFn(RequestCol{req.ContentLength, req.Body})
 				log.Printf("handling %s\n", task.Name())
-				task.Exec(p.SerializeFn(w))
+				task.Exec(NewSink(p.SerializeFn(w)))
 				break
 			}
 		}

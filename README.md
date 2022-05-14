@@ -24,7 +24,7 @@ It contains a simple data processing pipeline.
 You can run it in "demo" mode:
 
 ```
->go1.18beta build example/wordcount/wordcount.go
+>go build example/wordcount/wordcount.go
 >wordcount
 ```
 

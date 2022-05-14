@@ -47,7 +47,7 @@ func StaticAnalyze[T any](StreamHandle StreamHandle, analyzer Analyzer[T]) T {
 type Analyzer[T any] func(StreamHandle StreamHandle, deps ...StreamHandle) T
 
 // Stream[T] is a deferred computation that yields a bag (multiset) of T values.
-// The type plays a role similar to Streamlection[T] from Apache Beam SDK.
+// The type plays a role similar to PCollection[T] from Apache Beam SDK.
 //
 // The simplest way to run a pipeline is:
 // c.Exec(NewSink[T](func (elem T) { ...do something with elem... })
@@ -229,24 +229,6 @@ func forEach[T any](elems []T, emit func(T)) {
 	}
 }
 
-type StringCol []string
-
-func (p StringCol) Name() string {
-	return fmt.Sprintf("[]string of length %d", len([]string(p)))
-}
-
-func (p StringCol) Exec(engine Engine[string]) {
-	engine.initialize(p)
-	forEach([]string(p), engine.emit)
-	engine.done(p)
-}
-
-func (p StringCol) Deps() []StreamHandle {
-	return nil
-}
-
-var _ Stream[string] = StringCol{}
-
 type flattened[T any] struct {
 	pp Stream[[]T]
 }
@@ -273,11 +255,6 @@ func (f flattened[T]) Deps() []StreamHandle {
 // Flatten of Stream[Stream[T]] is left as exercise to the reader.
 func Flatten[T any](pp Stream[[]T]) Stream[T] {
 	return flattened[T]{pp}
-}
-
-type Pair[X, Y any] struct {
-	Fst X
-	Snd Y
 }
 
 type counted[T comparable] struct {
@@ -337,4 +314,36 @@ func (f filtered[T]) Deps() []StreamHandle {
 
 func Filter[T any](fn func(T) bool) func(Stream[T]) Stream[T] {
 	return func(p Stream[T]) Stream[T] { return filtered[T]{p, fn} }
+}
+
+type selective[S, T any] struct {
+	in Stream[Either[S, T]]
+	fn func(S) T
+}
+
+// ProcessSelected takes a Stream[Either[S, T]] and applies fn to transform all S values into T.
+// The availability of this operation selective applicative functor.
+func ProcessSelected[S, T any](fn func(S) T) func(Stream[Either[S, T]]) Stream[T] {
+	return func(in Stream[Either[S, T]]) Stream[T] { return selective[S, T]{in, fn} }
+}
+
+func (s selective[S, T]) Name() string {
+	return fmt.Sprintf("processSelected(%v)", s.in.Name())
+}
+
+func (s selective[S, T]) Exec(engine Engine[T]) {
+	engine.initialize(s)
+	sink := connect(func(v Either[S, T]) {
+		if v.IsLeft() {
+			engine.emit(s.fn(v.Left()))
+		} else {
+			engine.emit(v.Right())
+		}
+	}, engine)
+	s.in.Exec(sink)
+	engine.done(s)
+}
+
+func (s selective[S, T]) Deps() []StreamHandle {
+	return []StreamHandle{s.in}
 }

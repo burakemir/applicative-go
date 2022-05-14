@@ -60,13 +60,25 @@ func constructPipeline(source ap.Stream[string]) ap.Stream[ap.Pair[string, int]]
 	pFiltered := ap.Filter(func(str string) bool {
 		return str != ""
 	})(pCleaned)
-	return ap.Count(pFiltered)
+
+	pIdentifySmallWords := ap.Fmap(identifySmallWord)(pFiltered)
+	pMarkSmallWords := ap.ProcessSelected(func(s string) string { return "*" + s })(pIdentifySmallWords)
+	return ap.Count(pMarkSmallWords)
 }
 
 func constructPipelineSerialize(source ap.Stream[string]) ap.Stream[string] {
 	return ap.Fmap(func(p ap.Pair[string, int]) string {
 		return fmt.Sprintf("%s:%d\n", p.Fst, p.Snd)
 	})(constructPipeline(source))
+}
+
+func identifySmallWord(str string) ap.Either[string, string] {
+	for _, s := range []string{"a", "in", "of", "on", "the"} {
+		if s == str {
+			return ap.Left[string, string]{Value: str}
+		}
+	}
+	return ap.Right[string, string]{Value: str}
 }
 
 func main() {
@@ -88,6 +100,8 @@ func main() {
 		pCounts.Exec(ap.NewDebugSink(func(elem ap.Pair[string, int]) {
 			fmt.Printf("%s:%d\n", elem.Fst, elem.Snd)
 		}))
+
+		fmt.Println("-- Time for some conditional processing.")
 	case "server":
 		fmt.Println("-- Starting server at :8080")
 		fmt.Println("-- try: curl localhost:8080/in -H \"process: wordcount\" --data \"hello world\"")

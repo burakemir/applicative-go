@@ -45,6 +45,16 @@ type Pair[X, Y any] struct {
 	Snd Y
 }
 
+type Timestamped[T any] struct {
+	Value     T
+	timestamp int64
+}
+
+type ValueWithWindows[T any] struct {
+	Value     T
+	WindowIDs []int64
+}
+
 type StringCol []string
 
 func (p StringCol) Name() string {

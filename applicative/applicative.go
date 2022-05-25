@@ -322,7 +322,8 @@ type selective[S, T any] struct {
 }
 
 // ProcessSelected takes a Stream[Either[S, T]] and applies fn to transform all S values into T.
-// The availability of this operation selective applicative functor.
+// This operation makes Stream a "selective" applicative functor and can be used to process
+// items conditionally.
 func ProcessSelected[S, T any](fn func(S) T) func(Stream[Either[S, T]]) Stream[T] {
 	return func(in Stream[Either[S, T]]) Stream[T] { return selective[S, T]{in, fn} }
 }
@@ -346,4 +347,31 @@ func (s selective[S, T]) Exec(engine Engine[T]) {
 
 func (s selective[S, T]) Deps() []StreamHandle {
 	return []StreamHandle{s.in}
+}
+
+type windowed[T any] struct {
+	in       Stream[T]
+	windowFn func(T) []int64
+}
+
+// Windowed assigns to each element of a stream a set of windows.
+func Windowed[T any](windowFn func(T) []int64) func(Stream[T]) Stream[ValueWithWindows[T]] {
+	return func(in Stream[T]) Stream[ValueWithWindows[T]] { return windowed[T]{in, windowFn} }
+}
+
+func (w windowed[T]) Name() string {
+	return fmt.Sprintf("windowed(%v)", w.in.Name())
+}
+
+func (w windowed[T]) Deps() []StreamHandle {
+	return []StreamHandle{w.in}
+}
+
+func (w windowed[T]) Exec(engine Engine[ValueWithWindows[T]]) {
+	engine.initialize(w)
+	sink := connect(func(value T) {
+		engine.emit(ValueWithWindows[T]{value, w.windowFn(value)})
+	}, engine)
+	w.in.Exec(sink)
+	engine.done(w)
 }

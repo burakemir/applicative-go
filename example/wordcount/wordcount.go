@@ -17,10 +17,12 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
-	"io"
 	"strings"
+	"time"
 
 	ap "github.com/burakemir/applicative-go/applicative"
 )
@@ -49,27 +51,69 @@ func getStreamHandleNames(n ap.StreamHandle, deps ...ap.StreamHandle) string {
 	return sb.String()
 }
 
-func constructPipeline(source ap.Stream[string]) ap.Stream[ap.Pair[string, int]] {
-	pSplit := ap.Fmap(func(str string) []string {
+type oneMinuteTumblingWindowsControl struct {
+}
+
+func (c oneMinuteTumblingWindowsControl) Obsolete(paneID int64) bool {
+	windowTime := time.UnixMicro(paneID)
+	return windowTime.Before(time.Now().Add(-2 * time.Minute))
+}
+
+func (c oneMinuteTumblingWindowsControl) AccumulationMode() ap.AccumulationMode {
+	return ap.AccumulateFiredPane
+}
+
+func (c oneMinuteTumblingWindowsControl) Trigger() <-chan struct{} {
+	trigger := make(chan struct{})
+	ticker := time.NewTicker(100 * time.Millisecond)
+	go func() {
+		<-ticker.C
+		trigger <- struct{}{}
+	}()
+	return trigger
+}
+
+func oneMinuteTumblingWindowsFn(v ap.Timestamped[string]) []time.Time {
+	return []time.Time{time.UnixMicro(v.Timestamp).Truncate(time.Minute).Add(time.Minute)}
+}
+
+func constructPipeline(source ap.Stream[ap.Timestamped[[]byte]]) ap.Stream[ap.Timestamped[[]ap.Pair[string, int]]] {
+	pWords := ap.FlattenWithTime(ap.FmapWithTime(func(body []byte) []string {
+		var words []string
+		scanner := bufio.NewScanner(bytes.NewReader(body))
+		for scanner.Scan() {
+			words = append(words, scanner.Text())
+		}
+		return words
+	})(source))
+	pSplit := ap.FlattenWithTime(ap.FmapWithTime(func(str string) []string {
 		return strings.Split(str, " ")
-	})(source)
-	pFlattened := ap.Flatten(pSplit)
-	pCleaned := ap.Fmap(func(str string) string {
+	})(pWords))
+	pCleaned := ap.FmapWithTime(func(str string) string {
 		return strings.ToLower(strings.TrimSpace(strings.Replace(str, ",", " ", -1)))
-	})(pFlattened)
-	pFiltered := ap.Filter(func(str string) bool {
+	})(pSplit)
+	pFiltered := ap.FilterWithTime(func(str string) bool {
 		return str != ""
 	})(pCleaned)
 
-	pIdentifySmallWords := ap.Fmap(identifySmallWord)(pFiltered)
-	pMarkSmallWords := ap.ProcessSelected(func(s string) string { return "*" + s })(pIdentifySmallWords)
-	return ap.Count(pMarkSmallWords)
+	pIdentifySmallWords := ap.FmapWithTime(identifySmallWord)(pFiltered)
+	pMarkSmallWords := ap.ProcessSelectedWithTime(func(s string) string { return "*" + s })(pIdentifySmallWords)
+
+	windowed := ap.WindowedStripTime(oneMinuteTumblingWindowsFn, &oneMinuteTumblingWindowsControl{})(pMarkSmallWords)
+	return ap.Count(windowed) // TODO
 }
 
-func constructPipelineSerialize(source ap.Stream[string]) ap.Stream[string] {
-	return ap.Fmap(func(p ap.Pair[string, int]) string {
-		return fmt.Sprintf("%s:%d\n", p.Fst, p.Snd)
-	})(constructPipeline(source))
+func formatTable(table ap.Timestamped[[]ap.Pair[string, int]]) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "[%s]\n", time.UnixMicro(table.Timestamp))
+	for _, e := range table.Value {
+		fmt.Fprintf(&sb, "%s:%d\n", e.Fst, e.Snd)
+	}
+	return sb.String()
+}
+
+func constructPipelineSerialize(source ap.Stream[ap.Timestamped[[]byte]]) ap.Stream[string] {
+	return ap.Fmap(formatTable)(constructPipeline(source))
 }
 
 func identifySmallWord(str string) ap.Either[string, string] {
@@ -85,10 +129,10 @@ func main() {
 	flag.Parse()
 	switch *mode {
 	case "demo":
-		pStrings := ap.StringCol([]string{
-			"The glitter of sunlight on roughened water, the glory of the stars,",
-			"the innocence of morning, the smell of the sea in harbors, ",
-		})
+		pStrings := ap.Ret(ap.Timestamped[[]byte]{[]byte(`
+			The glitter of sunlight on roughened water, the glory of the stars,
+			the innocence of morning, the smell of the sea in harbors`),
+			time.Now().UnixMicro()})
 
 		pCounts := constructPipeline(pStrings)
 		fmt.Printf("Pipeline %s\n", pCounts.Name())
@@ -97,8 +141,8 @@ func main() {
 		fmt.Println(ap.StaticAnalyze(pCounts, getStreamHandleNames))
 
 		fmt.Println("-- Now let's run this pipeline.")
-		pCounts.Exec(ap.NewDebugSink(func(elem ap.Pair[string, int]) {
-			fmt.Printf("%s:%d\n", elem.Fst, elem.Snd)
+		pCounts.Exec(ap.NewDebugSink(func(table ap.Timestamped[[]ap.Pair[string, int]]) {
+			fmt.Printf(formatTable(table))
 		}))
 
 		fmt.Println("-- Time for some conditional processing.")
@@ -106,15 +150,7 @@ func main() {
 		fmt.Println("-- Starting server at :8080")
 		fmt.Println("-- try: curl localhost:8080/in -H \"process: wordcount\" --data \"hello world\"")
 		h := ap.NewHub(":8080")
-		h.Register(&ap.Process{
-			Name:       "wordcount",
-			PipelineFn: constructPipelineSerialize,
-			SerializeFn: func(w io.Writer) func(string) {
-				return func(resultLine string) {
-					io.WriteString(w, resultLine)
-				}
-			}})
+		h.Register(ap.NewProcess("wordcount", constructPipelineSerialize))
 		h.Run()
 	}
-
 }

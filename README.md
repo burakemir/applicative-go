@@ -41,5 +41,6 @@ This will run a HTTP server at `localhost:8080`.
 Call it in a separate tab:
 ```
 curl localhost:8080/in -H "process: wordcount" --data "hello world"
+curl localhost:8080/out -H "process: wordcount"
 ```
 

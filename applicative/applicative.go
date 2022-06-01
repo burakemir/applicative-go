@@ -29,7 +29,10 @@
 // in structuring this problem domain.
 package applicative
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // StreamHandle is a Stream[A] where we don't care about its data type.
 type StreamHandle interface {
@@ -154,11 +157,20 @@ func (m Mapped[S, T]) Deps() []StreamHandle {
 	return []StreamHandle{m.in}
 }
 
-// We choose a principled way to compose our deferred computations.
-// This is called fmap in Haskell.
+// Fmap applies f a transformation (map, function) to every element of a stream.
 func Fmap[S, T any](fn func(S) T) func(Stream[S]) Stream[T] {
 	return func(in Stream[S]) Stream[T] {
 		return Mapped[S, T]{fn, in}
+	}
+}
+
+// Fmap applies f a transformation (map, function) to every element of a stream of
+// timestamped values, preserving the timestamp.
+func FmapWithTime[S, T any](fn func(S) T) func(Stream[Timestamped[S]]) Stream[Timestamped[T]] {
+	return func(in Stream[Timestamped[S]]) Stream[Timestamped[T]] {
+		return Mapped[Timestamped[S], Timestamped[T]]{func(s Timestamped[S]) Timestamped[T] {
+			return Timestamped[T]{fn(s.Value), s.Timestamp}
+		}, in}
 	}
 }
 
@@ -204,7 +216,7 @@ type ret[T any] struct {
 }
 
 func (r ret[T]) Name() string {
-	return fmt.Sprintf("ret(%v)", r.value)
+	return fmt.Sprintf("ret(<singleton>)")
 }
 
 func (r ret[T]) Exec(engine Engine[T]) {
@@ -217,8 +229,7 @@ func (r ret[T]) Deps() []StreamHandle {
 	return nil
 }
 
-// Ret turns a value of type T into a defered (immediate) computation.
-// In Haskell, this is called "pure".
+// Ret turns a value of type T into a singleton stream.
 func Ret[T any](value T) Stream[T] {
 	return ret[T]{value}
 }
@@ -252,49 +263,81 @@ func (f flattened[T]) Deps() []StreamHandle {
 	return []StreamHandle{f.pp}
 }
 
-// Flatten of Stream[Stream[T]] is left as exercise to the reader.
+// Flatten turns a stream of slices into a flat stream of elements.
 func Flatten[T any](pp Stream[[]T]) Stream[T] {
 	return flattened[T]{pp}
 }
 
+type flattenedWithTime[T any] struct {
+	in Stream[Timestamped[[]T]]
+}
+
+func (f flattenedWithTime[T]) Name() string {
+	return fmt.Sprintf("flattenWithTime(%v)", f.in.Name())
+}
+
+func (f flattenedWithTime[T]) Exec(engine Engine[Timestamped[T]]) {
+	engine.initialize(f)
+	sink := connect(func(ts Timestamped[[]T]) {
+		for _, t := range ts.Value {
+			engine.emit(Timestamped[T]{t, ts.Timestamp})
+		}
+	}, engine)
+	f.in.Exec(sink)
+	engine.done(f)
+}
+
+func (f flattenedWithTime[T]) Deps() []StreamHandle {
+	return []StreamHandle{f.in}
+}
+
+// Flatten of Stream[Stream[T]] is left as exercise to the reader.
+func FlattenWithTime[T any](pp Stream[Timestamped[[]T]]) Stream[Timestamped[T]] {
+	return flattenedWithTime[T]{pp}
+}
+
 type counted[T comparable] struct {
-	p Stream[T]
+	in Stream[*WindowPane[T]]
 }
 
 func (c counted[T]) Name() string {
-	return fmt.Sprintf("count(%s)", c.p.Name())
+	return fmt.Sprintf("count(%s)", c.in.Name())
 }
 
-func (c counted[T]) Exec(engine Engine[Pair[T, int]]) {
+func (c counted[T]) Exec(engine Engine[Timestamped[[]Pair[T, int]]]) {
 	engine.initialize(c)
-	counts := make(map[T]int)
-	counter := connect(func(t T) {
-		count := counts[t]
-		count += 1
-		counts[t] = count
+	counter := connect(func(w *WindowPane[T]) {
+		counts := make(map[T]int)
+		for _, t := range w.Values {
+			count := counts[t]
+			count += 1
+			counts[t] = count
+		}
+		res := make([]Pair[T, int], 0, len(counts))
+		for k, v := range counts {
+			res = append(res, Pair[T, int]{k, v})
+		}
+		engine.emit(Timestamped[[]Pair[T, int]]{res, w.EndTime.UnixMicro()})
 	}, engine)
-	c.p.Exec(counter)
-	for k, v := range counts {
-		engine.emit(Pair[T, int]{k, v})
-	}
+	c.in.Exec(counter)
 	engine.done(c)
 }
 
 func (c counted[T]) Deps() []StreamHandle {
-	return []StreamHandle{c.p}
+	return []StreamHandle{c.in}
 }
 
-func Count[T comparable](p Stream[T]) Stream[Pair[T, int]] {
+func Count[T comparable](p Stream[*WindowPane[T]]) Stream[Timestamped[[]Pair[T, int]]] {
 	return counted[T]{p}
 }
 
 type filtered[T any] struct {
-	p  Stream[T]
+	in Stream[T]
 	fn func(T) bool
 }
 
 func (f filtered[T]) Name() string {
-	return fmt.Sprintf("filter(%s)", f.p.Name())
+	return fmt.Sprintf("filter(%s)", f.in.Name())
 }
 
 func (f filtered[T]) Exec(engine Engine[T]) {
@@ -304,16 +347,27 @@ func (f filtered[T]) Exec(engine Engine[T]) {
 			engine.emit(t)
 		}
 	}, engine)
-	f.p.Exec(sink)
+	f.in.Exec(sink)
 	engine.done(f)
 }
 
 func (f filtered[T]) Deps() []StreamHandle {
-	return []StreamHandle{f.p}
+	return []StreamHandle{f.in}
 }
 
+// Filter retains only those elements for which fn returns true.
 func Filter[T any](fn func(T) bool) func(Stream[T]) Stream[T] {
 	return func(p Stream[T]) Stream[T] { return filtered[T]{p, fn} }
+}
+
+// FilterWithTime retains only those timestamped elements for which fn returns true.
+func FilterWithTime[T any](fn func(T) bool) func(Stream[Timestamped[T]]) Stream[Timestamped[T]] {
+	return func(in Stream[Timestamped[T]]) Stream[Timestamped[T]] {
+		return filtered[Timestamped[T]]{
+			in,
+			func(v Timestamped[T]) bool { return fn(v.Value) },
+		}
+	}
 }
 
 type selective[S, T any] struct {
@@ -349,14 +403,80 @@ func (s selective[S, T]) Deps() []StreamHandle {
 	return []StreamHandle{s.in}
 }
 
-type windowed[T any] struct {
-	in       Stream[T]
-	windowFn func(T) []int64
+type selectiveWithTime[S, T any] struct {
+	in Stream[Timestamped[Either[S, T]]]
+	fn func(S) T
 }
 
-// Windowed assigns to each element of a stream a set of windows.
-func Windowed[T any](windowFn func(T) []int64) func(Stream[T]) Stream[ValueWithWindows[T]] {
-	return func(in Stream[T]) Stream[ValueWithWindows[T]] { return windowed[T]{in, windowFn} }
+// ProcessSelectedWithTime takes a Stream[Timestamped[Either[S, T]]] and applies fn to transform
+// all S values into T, preserving timestamp.
+func ProcessSelectedWithTime[S, T any](fn func(S) T) func(Stream[Timestamped[Either[S, T]]]) Stream[Timestamped[T]] {
+	return func(in Stream[Timestamped[Either[S, T]]]) Stream[Timestamped[T]] {
+		return selectiveWithTime[S, T]{in, fn}
+	}
+}
+
+func (s selectiveWithTime[S, T]) Deps() []StreamHandle {
+	return []StreamHandle{s.in}
+}
+
+func (s selectiveWithTime[S, T]) Exec(engine Engine[Timestamped[T]]) {
+	engine.initialize(s)
+	sink := connect(func(v Timestamped[Either[S, T]]) {
+		if v.Value.IsLeft() {
+			engine.emit(Timestamped[T]{s.fn(v.Value.Left()), v.Timestamp})
+		} else {
+			engine.emit(Timestamped[T]{v.Value.Right(), v.Timestamp})
+		}
+	}, engine)
+	s.in.Exec(sink)
+	engine.done(s)
+}
+
+func (s selectiveWithTime[S, T]) Name() string {
+	return fmt.Sprintf("processSelectedWithTime(%v)", s.in.Name())
+}
+
+// WindowControl is an object that controls when a window pane is emitted.
+// It takes care of creating window panes.
+type WindowControl interface {
+	// If this returns true, the pane will no longer fire.
+	Obsolete(paneID int64) bool
+	// Returns the accumulation mode.
+	AccumulationMode() AccumulationMode
+	// Kicks off downstream computation.
+	Trigger() <-chan struct{}
+}
+
+func (w *windowed[T]) getOrCreate(endTime time.Time) *WindowPane[T] {
+	endTimeUsec := endTime.UnixMicro()
+	if w.control.Obsolete(endTimeUsec) {
+		return nil
+	}
+	pane, ok := w.windowPane[endTimeUsec]
+	if !ok {
+		pane = &WindowPane[T]{endTime, []T{}}
+		w.windowPane[endTimeUsec] = pane
+	}
+	return pane
+}
+
+type windowed[T any] struct {
+	in Stream[T]
+	// Assigns Stream element to window panes.
+	windowFn func(T) []time.Time
+	// Creates window panes and triggers downstream computation.
+	control WindowControl
+	// Maps window pane ID to active window panes.
+	windowPane map[int64]*WindowPane[T]
+	dirty      map[int64]bool
+}
+
+// Windowed turns to streamm of element into a stream of windows.
+func Windowed[T any](windowFn func(T) []time.Time, control WindowControl) func(Stream[T]) Stream[*WindowPane[T]] {
+	return func(in Stream[T]) Stream[*WindowPane[T]] {
+		return windowed[T]{in, windowFn, control, make(map[int64]*WindowPane[T]), make(map[int64]bool)}
+	}
 }
 
 func (w windowed[T]) Name() string {
@@ -367,11 +487,125 @@ func (w windowed[T]) Deps() []StreamHandle {
 	return []StreamHandle{w.in}
 }
 
-func (w windowed[T]) Exec(engine Engine[ValueWithWindows[T]]) {
+func (w windowed[T]) Exec(engine Engine[*WindowPane[T]]) {
 	engine.initialize(w)
 	sink := connect(func(value T) {
-		engine.emit(ValueWithWindows[T]{value, w.windowFn(value)})
+		for _, paneID := range w.windowFn(value) {
+			if pane := w.getOrCreate(paneID); pane != nil {
+				pane.Values = append(pane.Values, value)
+				w.dirty[paneID.UnixMicro()] = true
+			}
+		}
 	}, engine)
+	trigger := w.control.Trigger()
+	done := make(chan struct{})
+	// Triggering downstream computation is async.
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-trigger:
+				for paneID, pane := range w.windowPane {
+					if w.control.Obsolete(paneID) {
+						delete(w.windowPane, paneID)
+						continue
+					}
+					if w.dirty[paneID] {
+						engine.emit(pane)
+						w.dirty[paneID] = false
+						if w.control.AccumulationMode() == DiscardFiredPane {
+							delete(w.windowPane, paneID)
+						}
+					}
+				}
+			}
+		}
+	}()
 	w.in.Exec(sink)
 	engine.done(w)
+	done <- struct{}{}
+}
+
+type windowedStripTime[T any] struct {
+	in Stream[Timestamped[T]]
+	// Assigns Stream element to window panes.
+	windowFn func(Timestamped[T]) []time.Time
+	// Creates window panes and triggers downstream computation.
+	control WindowControl
+	// Maps window pane ID to active window panes.
+	windowPane map[int64]*WindowPane[T]
+	dirty      map[int64]bool
+}
+
+func (w *windowedStripTime[T]) getOrCreate(endTime time.Time) *WindowPane[T] {
+	endTimeUsec := endTime.UnixMicro()
+	if w.control.Obsolete(endTimeUsec) {
+		return nil
+	}
+	pane, ok := w.windowPane[endTimeUsec]
+	if !ok {
+		pane = &WindowPane[T]{endTime, []T{}}
+		w.windowPane[endTimeUsec] = pane
+	}
+	return pane
+}
+
+func (w windowedStripTime[T]) Name() string {
+	return fmt.Sprintf("windowedStripTime(%v)", w.in.Name())
+}
+
+func (w windowedStripTime[T]) Deps() []StreamHandle {
+	return []StreamHandle{w.in}
+}
+
+func (w windowedStripTime[T]) Exec(engine Engine[*WindowPane[T]]) {
+	engine.initialize(w)
+	sink := connect(func(tsvalue Timestamped[T]) {
+		for _, endTime := range w.windowFn(tsvalue) {
+			if pane := w.getOrCreate(endTime); pane != nil {
+				pane.Values = append(pane.Values, tsvalue.Value)
+				w.dirty[endTime.UnixMicro()] = true
+			}
+		}
+	}, engine)
+	ticker := time.NewTicker(1 * time.Second)
+	done := make(chan struct{})
+	// Triggering downstream computation is async.
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				for paneID, pane := range w.windowPane {
+					if w.control.Obsolete(paneID) {
+						delete(w.windowPane, paneID)
+						continue
+					}
+					if w.dirty[paneID] {
+						engine.emit(pane)
+						w.dirty[paneID] = false
+
+						if w.control.AccumulationMode() == DiscardFiredPane {
+							delete(w.windowPane, paneID)
+						}
+					}
+				}
+			}
+		}
+	}()
+	w.in.Exec(sink)
+	engine.done(w)
+	// Need to wait to give ticker a chance to fire window.
+	time.Sleep(1 * time.Second)
+	ticker.Stop()
+	done <- struct{}{}
+}
+
+// WindowedStripTime assigns to each timestamped element of a stream a set of windows.
+func WindowedStripTime[T any](windowFn func(Timestamped[T]) []time.Time, control WindowControl) func(Stream[Timestamped[T]]) Stream[*WindowPane[T]] {
+	return func(in Stream[Timestamped[T]]) Stream[*WindowPane[T]] {
+		return windowedStripTime[T]{in, windowFn, control, make(map[int64]*WindowPane[T]), make(map[int64]bool)}
+	}
 }
